@@ -1,214 +1,216 @@
-#include <cstdlib>
 #include <iostream>
-#include <pthread.h>
-#include <string.h>
-#include <sys/types.h>
-#include <sys/stat.h>
+#include <getopt.h>
 #include <fcntl.h>
-#include <errno.h>
-#include <stdlib.h>
-#include <stdio.h>
-#include <assert.h>
+#include <sys/types.h>
 #include <unistd.h>
+#include <pthread.h>
+#include <vector>
 
-char * TEXT_PATH;// "/home/bill/study/qnx/text.txt"
-char * ENCRYPT_PATH; // "/home/bill/study/qnx/encrypt.txt"
-char * DECRYPT_PATH; //"/home/bill/study/qnx/decrypt.txt"
-int PTHREAD_NUM; 
+using namespace std;
 
-pthread_barrier_t bar;
+int INPUT_SIZE;
 
-
-
-typedef struct keygen_params
+struct CmdArgv
 {
-	int a;
-	int m;
-	int c;
-	int X0;
-}keygen_params;
+    char* path_to_text;
+    char* patch_to_cypher;
+    int x;
+    int a;
+    int c;
+    int m;
+};
 
-typedef struct crypt_params
+struct Worker 
 {
-	char* msg;
-	size_t size;
-	char* key;
-	char* outText;
-}crypt_params;
+    pthread_barrier_t* barrier;
+    char* text;
+    char* output_text;
+    char* randomizer;
+    int down_index;
+    int top_index;
+};
 
-void killTask(char* msg);
-void* keyGeneration(void* param);
-void* encryption(void* param);
+void* LCG(void* cmd_argv_ptr);
+void* encrypt(void * worker_ptr);
 
 
-int main(int argc, char *argv[])
+
+int main(int argc, char* argv[]) 
 {
-	for (int i =0; i < argc; i++)
-		std::cout << argv[i] << std::endl;
+    if (argc > 13)
+    {
+        std::cout << "ERROR! Too much arguments!" << std::endl;
+        exit(1);
+    }
+    if (argc < 13)
+    {
+        std::cout << "ERROR! Not enough arguments!" << std::endl;
+        exit(1);
+    }
+    int c;
+    CmdArgv cmd_argv;
+    while ((c = getopt(argc, argv, "i:o:x:a:c:m:")) != -1)
+    {
+        switch (c)
+        {
+            case 'i':
+                cmd_argv.path_to_text = optarg;
+                break;
+            case 'o':
+                cmd_argv.patch_to_cypher = optarg;
+                break;
+            case 'x':
+                cmd_argv.x = atoi(optarg);
+                break;
+            case 'a':
+                cmd_argv.a = atoi(optarg);
+                break;
+            case 'c':
+                cmd_argv.c = atoi(optarg);
+                break;
+            case 'm':
+                cmd_argv.m = atoi(optarg);
+                break;
+            default:
+                break;
+        }
+    }
 
-	int len = strlen(argv[1]);
-	TEXT_PATH = new char[len];
-	TEXT_PATH = argv[1];
+    if (optind < argc) 
+    {
+        std::cout << "ERROR! Can't recognize elements" << std::endl;
+        exit(1);
+    }
 
-	len = strlen(argv[2]);
-	ENCRYPT_PATH = new char[len];
-	ENCRYPT_PATH = argv[2];
+    int input_file = open(cmd_argv.path_to_text, O_RDONLY);
+    if (input_file == -1)
+    {
+        std::cout << "ERROR! Unable to open file " << cmd_argv.path_to_text << " file" << std::endl;
+        exit(1);
+    }
 
-	len = strlen(argv[3]);
-	DECRYPT_PATH = new char[len];
-	DECRYPT_PATH = argv[3];
-	
-	char *CMD = new char[1];
-	CMD = argv[8];
+    INPUT_SIZE = lseek(input_file, 0, SEEK_END);
+    if (INPUT_SIZE > 10000)
+    {
+        std::cout << "ERROR! Size of file is too large!"<< std:: endl;
+        exit(1);
+    }
+    lseek(input_file, 0, SEEK_SET);
 
-	PTHREAD_NUM = sysconf(_SC_NPROCESSORS_ONLN);
-	pthread_t keygenThread, cryptThread[PTHREAD_NUM];
-	keygen_params keygenParams;
-	crypt_params cryptParams[PTHREAD_NUM];
-	int textFd = 0;
-	int encryptFd = 0;
-	int decryptFd = 0;
-	char *buffer = NULL;
-	char *key = NULL;
-	struct stat sb;
+    char* text = new char[INPUT_SIZE];
+    if(read(input_file, text, INPUT_SIZE) == -1)
+    {
+        std::cout << "ERROR! Can't map the input file to RAM" << std::endl;
+        exit(1);
+    }
 
-	memset(&keygenParams, 0, sizeof(keygenParams));
-	memset(&cryptParams, 0, sizeof(cryptParams));
+    pthread_t keygen_thread;
+    if (pthread_create(&keygen_thread, NULL, LCG, &cmd_argv) != 0)
+    {
+        std::cout << "ERROR! Unable to create a new keygen thread" << std::endl;
+        exit(1);
+    }
 
-	pthread_barrier_init(&bar, NULL, PTHREAD_NUM+1);
+    char* randomizer = nullptr;
+    if(pthread_join(keygen_thread, (void**)&randomizer))
+    {
+        std::cout << "ERROR! Unable to join a keygen thread thread" << std::endl;
+        exit(1);
+    }
 
-	if ((textFd = open(TEXT_PATH, O_RDONLY)) < 0)
-		killTask("[-]open failed");
+    pthread_barrier_t barrier;
 
-	if (stat(TEXT_PATH, &sb) < 0)
-		killTask("[-]stat failed");
+    // Number of CPUs available
+    int number_of_processors = sysconf(_SC_NPROCESSORS_ONLN);
 
-	printf("TXT size:%d\n", sb.st_size);
-	buffer = new char[sb.st_size+1];
-	assert(buffer != NULL);
+    pthread_barrier_init(&barrier, NULL, number_of_processors + 1);
+    pthread_t crypt_threads[number_of_processors];
+    std::vector <Worker*> workers;
 
-	keygenParams.a = atoi(argv[4]);
-	keygenParams.m = atoi(argv[5]);
-	keygenParams.c = atoi(argv[6]);
-	keygenParams.X0 = atoi(argv[7]);
+    size_t part_len = INPUT_SIZE / number_of_processors;
+    if (INPUT_SIZE % number_of_processors != 0)
+        part_len ++;
 
-	if (pthread_create(&keygenThread, NULL, &keyGeneration, &keygenParams) < 0)
-		killTask("[-]pthread_create");
+    char* output_text = new char[INPUT_SIZE];
+    for(int i = 0; i < number_of_processors; i++)
+    {
+        Worker* worker = new Worker;
 
-	if (pthread_join(keygenThread, (void**)&key) < 0)
-		killTask("[-]failed to wait for keyGeneration thread to finish");
+        worker->barrier = &barrier;
+        worker->text = text;
+        worker->output_text = output_text;
+        worker->randomizer = randomizer;
+        worker->down_index = i * part_len;
 
-	printf("KEY:[%d]%s\n",strlen(key), key);
+        if (i == number_of_processors - 1)
+            worker->top_index = INPUT_SIZE;
+        else
+            worker->top_index = worker->down_index + part_len;
 
-	if (read(textFd, buffer, sb.st_size) != sb.st_size)
-		killTask("[-]read failed");
+        workers.push_back(worker);
+        pthread_create(&crypt_threads[i], NULL, encrypt, worker);
+    }
 
-	printf("%s\n", buffer);
+    int status = pthread_barrier_wait(&barrier);
+    if (status != 0 && status != PTHREAD_BARRIER_SERIAL_THREAD)
+    {
+        std::cout << "ERROR! Something wrong with barrier" << std::endl;
+        exit(status);
+    }
 
-	int bytesForEachThread = static_cast<int>(sb.st_size / PTHREAD_NUM);
-	int remainderForLast = sb.st_size % PTHREAD_NUM;
+    int output_file = open(cmd_argv.patch_to_cypher, O_WRONLY, O_TRUNC);
+    if (output_file == -1)
+    {
+        std::cout << "ERROR! Can't open " << cmd_argv.patch_to_cypher << " file" << std::endl;
+        exit(1);
+    }
 
-	int offset = 0;
-	for (int i = 0; i < PTHREAD_NUM; i++)
-	{
-			if (i == PTHREAD_NUM-1)
-				bytesForEachThread += remainderForLast;
+    write(output_file, output_text, INPUT_SIZE);
 
-			cryptParams[i].key = new char[strlen(key)+1];
-			assert(cryptParams[i].key != NULL);
-			memccpy(cryptParams[i].key, key + offset, bytesForEachThread,sizeof(char)*bytesForEachThread);
+    close(output_file);
 
-			cryptParams[i].msg = new char[bytesForEachThread];
-			assert(cryptParams[i].msg != NULL);
-			memccpy(cryptParams[i].msg, buffer + offset, bytesForEachThread,sizeof(char)*bytesForEachThread);
-			offset += bytesForEachThread;
+    pthread_barrier_destroy(&barrier);
 
-			cryptParams[i].size = bytesForEachThread;
-
-			if (pthread_create(&cryptThread[i], NULL, &encryption, &cryptParams[i]) < 0)
-				killTask("[-]create encryption thread failed");
-	}
-
-	pthread_barrier_wait(&bar);
-	
-	if ((encryptFd = open(ENCRYPT_PATH, O_CREAT | O_RDWR, 0777)) < 0)
-		killTask("[-]open encrypt file failed");
-	for (int i = 0; i < PTHREAD_NUM; i++)
-		if (write(encryptFd, cryptParams[i].outText, sb.st_size !=  sb.st_size))
-			killTask("[-]write to encrypt.txt failed");
-
-	printf("ENCRYPTED:");
-	for (int i = 0; i < PTHREAD_NUM; i++)
-		printf("%s", cryptParams[i].outText);
-		printf("\n");
-	if (*CMD == 'D'){
-	for (int i = 0; i < PTHREAD_NUM; i++)
-	{
-		memccpy(cryptParams[i].msg, cryptParams[i].outText, sb.st_size,sb.st_size);
-		memset(cryptParams[i].outText, 0 , sizeof(cryptParams[i].outText));
-		if (pthread_create(&cryptThread[i], NULL, &encryption, &cryptParams[i]) < 0)
-			killTask("[-]create decrypt thread failed");
-	}
-
-	if ((decryptFd = open(DECRYPT_PATH, O_CREAT | O_RDWR, 0777)) < 0)
-			killTask("[-]open decrypt file failed");
-	for (int i = 0; i < PTHREAD_NUM; i++)
-		if (write(decryptFd, cryptParams[i].outText, sb.st_size !=  sb.st_size))
-			killTask("[-]write to decrypt.txt failed");
-
-	pthread_barrier_wait(&bar);
-	}
-	printf("RESULT   :");
-	for (int i = 0; i < PTHREAD_NUM; i++)
-			printf("%s", cryptParams[i].outText);
-	printf("\n");
-
-	pthread_barrier_destroy(&bar);
-	close(textFd);
-	close(encryptFd);
-	close(decryptFd);
-	for (int i = 0; i < PTHREAD_NUM; i++)
-	{
-		delete[] cryptParams[i].key;
-		delete[] cryptParams[i].outText;
-		delete[] cryptParams[i].msg;
-	}
-	delete[] buffer;
-	delete[] key;
-	return EXIT_SUCCESS;
+    return 0;
 }
 
-void killTask(char* msg)
+void* LCG(void* cmd_argv_ptr)
 {
-	perror(msg);
-	exit(-1);
+    CmdArgv* cmd_argv = static_cast<CmdArgv*>(cmd_argv_ptr);
+    int x = cmd_argv->x;
+    int a = cmd_argv->a;
+    int c = cmd_argv->c;
+    int m = cmd_argv->m;
+
+    int count_of_int = INPUT_SIZE / sizeof(int);
+    int* buff = new int[count_of_int + 1];
+    buff[0] = x;
+
+    for(size_t i = 1; i < count_of_int + 1; i++)
+    {
+        buff[i]= (a * buff[i-1] + c) % m;
+    }
+
+    char* seq = reinterpret_cast<char *>(buff);
+    return seq;
 }
 
-void* keyGeneration(void* param)
+void* encrypt(void * worker_ptr)
 {
-	keygen_params* keygenParams = (keygen_params*)param;
-	struct stat sb;
-	char* key;
+    Worker* worker = static_cast<Worker*>(worker_ptr);
+    int top_index = worker->top_index;
+    int down_index = worker->down_index;
 
-	if (stat(TEXT_PATH, &sb) < 0)
-		killTask("[-]stat failed");
-	key = new char[sb.st_size];
+    while(down_index < top_index)
+    {
+        worker->output_text[down_index] = worker->randomizer[down_index] ^ worker->text[down_index];
+        down_index++;
+    }
 
-	key[0] = keygenParams->X0;
-	for (int i = 0; i < sb.st_size - 1; i++)
-		key[i + 1] = (keygenParams->a * key[i] + keygenParams->c) % keygenParams->m;
+    int status = pthread_barrier_wait(worker->barrier);
+    if (status != 0 && status != PTHREAD_BARRIER_SERIAL_THREAD) {
+        exit(status);
+    }
 
-	pthread_exit(key);
-}
-
-void* encryption(void* param)
-{
-	crypt_params* cryptParams = (crypt_params*)param;
-	cryptParams->outText = new char[cryptParams->size + 1];
-
-	for (size_t i = 0; i < cryptParams->size; i++)
-		cryptParams->outText[i] = cryptParams->msg[i] ^ cryptParams->key[i];
-
-	pthread_barrier_wait(&bar);
-	pthread_exit(0);
+    return nullptr;
 }
